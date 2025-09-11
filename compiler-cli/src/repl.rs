@@ -204,21 +204,31 @@ impl Engine for Deno {
         let mut stdin_ref = self.stdin.borrow_mut();
         let _ = std::io::Write::write_all(
             &mut *stdin_ref,
-            format!("import {{ {REPL_MAIN} }} from \"{path}\"; {REPL_MAIN}();\n").as_bytes(),
+            format!("import {{ {REPL_MAIN} }} from \"{path}\";
+                try {{
+                    {REPL_MAIN}();
+                }} catch (err) {{
+                    console.error(
+                        `Error at ${{err.module}}.${{err.function}}:${{err.line}}\n    Gleam error: ${{err.gleam_error}}`
+                    );
+                }} finally {{
+                    console.log(\"\0\");
+                }}\n").as_bytes(),
         );
 
         let mut stdout_ref = self.stdout.borrow_mut();
-        let mut reader = BufReader::new(&mut *stdout_ref);
-        let mut buffer = String::new();
+        let mut buffer = [0; 1024];
         loop {
-            buffer.clear();
-            let bytes_read = reader.read_line(&mut buffer).expect("Unable to read chunk");
-            let trimmed = buffer.trim();
+            let n = stdout_ref.read(&mut buffer).unwrap();
+            if n > 0 {
+                let buf = String::from_utf8_lossy(&buffer[..n]);
+                let trimmed = buf.trim();
+                std::io::Write::flush(&mut std::io::stdout()).unwrap();
 
-            if bytes_read == 0 || trimmed == "undefined" {
-                break;
+                if trimmed == "\0" {
+                    break;
+                }
             }
-            println!("{trimmed}");
         }
     }
 
@@ -444,11 +454,15 @@ impl<E: Engine> Repl<E> {
         // FIXME: avoid name collision
         src.push_str(&format! {"
             pub fn {REPL_MAIN}() {{
+              run_save()
+              Nil
+            }}
+
+            pub fn run_save() {{
               {lets}
               repl_print(repl_save({{
             {code}
               }}))
-              Nil
             }}
             "
         });
@@ -458,7 +472,7 @@ impl<E: Engine> Repl<E> {
         self.engine.run_main(&module.name);
 
         if self.engine.has_var(self.var_index) {
-            let main = get_function(&module, REPL_MAIN).expect("repl main function");
+            let main = get_function(&module, "run_save").expect("repl main function");
             let type_ = type_to_string(&module, &main.return_type);
             let index = self.var_index;
             let _ = self.vars.insert(name.into(), Value { index, type_ });
@@ -517,7 +531,6 @@ impl<E: Engine> Repl<E> {
               repl_print({{
             {expr}
               }})
-              Nil
             }}
             "
         });
