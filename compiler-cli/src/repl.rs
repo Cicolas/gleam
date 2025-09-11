@@ -17,7 +17,15 @@ use gleam_core::{
 use rustyline::{DefaultEditor, error::ReadlineError};
 use tempfile::{self, TempPath};
 
-use std::{collections::HashMap, fmt::Write, path::PathBuf, process::Command, rc::Rc};
+use std::{
+    cell::RefCell,
+    collections::HashMap,
+    fmt::Write,
+    io::{BufRead, BufReader, Read},
+    path::PathBuf,
+    process::{ChildStdin, ChildStdout, Command, Stdio},
+    rc::Rc, thread,
+};
 
 use crate::{
     cli,
@@ -137,39 +145,104 @@ fn build(paths: &ProjectPaths, progress: bool, warnings: bool) -> Result<Built, 
 trait Engine: Clone {
     fn new(paths: ProjectPaths, package: String) -> Self;
 
-    fn run_main(&self, module: &str);
+    fn run_main(&mut self, module: &str);
 
     fn has_var(&self, index: usize) -> bool;
 }
 
 #[derive(Clone)]
 struct Deno {
+    stdin: Rc<RefCell<ChildStdin>>,
+    stdout: Rc<RefCell<ChildStdout>>,
     paths: ProjectPaths,
     package: String,
 }
 
 impl Engine for Deno {
     fn new(paths: ProjectPaths, package: String) -> Self {
-        Deno { paths, package }
+        let command = Command::new("deno")
+            .arg("repl")
+            .arg("--allow-read")
+            .arg("--quiet")
+            .env("NO_COLOR", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("Could not spawn deno subprocess");
+
+        let stdin = command.stdin.expect("Could not take Deno stdin");
+        let stdout = command.stdout.expect("Could not take Deno stdout");
+        let mut stderr = command.stderr.expect("Could not take Deno stderr");
+
+        let _ = thread::spawn(move || {
+            let mut buffer = [0; 1024];
+            loop {
+                let n = stderr.read(&mut buffer).unwrap();
+                if n > 0 {
+                    print!("{}", String::from_utf8_lossy(&buffer[..n]));
+                    std::io::Write::flush(&mut std::io::stdout()).unwrap();
+                }
+            }
+        });
+
+        Deno {
+            stdin: Rc::new(RefCell::new(stdin)),
+            stdout: Rc::new(RefCell::new(stdout)),
+            paths,
+            package,
+        }
     }
 
-    fn run_main(&self, module: &str) {
+    fn run_main(&mut self, module: &str) {
         let path = self
             .paths
             .build_directory_for_target(Mode::Dev, Target::JavaScript)
             .join(&self.package)
             .join(format!("{module}.mjs"));
-        let _ = Command::new("deno")
-            .arg("eval")
-            .arg(format!(
-                "import {{ {REPL_MAIN} }} from \"{path}\"; {REPL_MAIN}();"
-            ))
-            .status()
-            .unwrap();
+
+        let mut stdin_ref = self.stdin.borrow_mut();
+        let _ = std::io::Write::write_all(
+            &mut *stdin_ref,
+            format!("import {{ {REPL_MAIN} }} from \"{path}\"; {REPL_MAIN}();\n").as_bytes(),
+        );
+
+        let mut stdout_ref = self.stdout.borrow_mut();
+        let mut reader = BufReader::new(&mut *stdout_ref);
+        let mut buffer = String::new();
+        loop {
+            buffer.clear();
+            let bytes_read = reader.read_line(&mut buffer).expect("Unable to read chunk");
+            let trimmed = buffer.trim();
+
+            if bytes_read == 0 || trimmed == "undefined" {
+                break;
+            }
+            println!("{trimmed}");
+        }
     }
 
-    fn has_var(&self, _index: usize) -> bool {
-        false
+    fn has_var(&self, index: usize) -> bool {
+        let mut stdin_ref = self.stdin.borrow_mut();
+        let _ = std::io::Write::write_all(
+            &mut *stdin_ref,
+            format!("{index} < globalThis.repl_vars.length\n").as_bytes(),
+        );
+
+        let mut stdout_ref = self.stdout.borrow_mut();
+        let mut reader = BufReader::new(&mut *stdout_ref);
+        let mut buffer = String::new();
+        loop {
+            buffer.clear();
+            let _ = reader.read_line(&mut buffer).expect("Unable to read chunk");
+            let trimmed = buffer.trim();
+
+            match trimmed {
+                "true" => return true,
+                "false" => return false,
+                _ => {}
+            }
+        }
     }
 }
 
@@ -279,7 +352,7 @@ impl<E: Engine> Repl<E> {
 
     fn compile(&mut self, code: &str) -> Result<Vec<Module>, Error> {
         // FIXME: avoid name collision
-        let path = TempPath::from_path(self.paths.src_directory().join("repl.gleam"));
+        let path = TempPath::from_path(self.paths.src_directory().join(format!("repl{}_{}.gleam", self.iter.0, self.iter.1)));
 
         let module_name = path.file_stem().unwrap().to_str().unwrap();
 
@@ -375,6 +448,7 @@ impl<E: Engine> Repl<E> {
               repl_print(repl_save({{
             {code}
               }}))
+              Nil
             }}
             "
         });
@@ -443,6 +517,7 @@ impl<E: Engine> Repl<E> {
               repl_print({{
             {expr}
               }})
+              Nil
             }}
             "
         });
