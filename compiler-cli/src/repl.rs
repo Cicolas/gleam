@@ -45,7 +45,7 @@ macro_rules! swriteln {
     };
 }
 
-const PROMPT: &str = "> ";
+const PROMPT: &str = "$ ";
 const HISTORY_FILE: &str = ".gleam_history";
 const QUIT: &str = ":quit";
 const TYPE: &str = ":type ";
@@ -208,11 +208,15 @@ impl Engine for Deno {
                 try {{
                     {REPL_MAIN}();
                 }} catch (err) {{
-                    console.error(
-                        `Error at ${{err.module}}.${{err.function}}:${{err.line}}\n    Gleam error: ${{err.gleam_error}}`
-                    );
+                    if (err.gleam_error) {{
+                        console.error(
+                            `Error at ${{err.module}}.${{err.function}}:${{err.line}}\n    Gleam error: ${{err.gleam_error}}`
+                        );
+                    }} else {{
+                        console.error({{err}});
+                    }}
                 }} finally {{
-                    console.log(\"\0\");
+                    console.log(\"\x03\x04\x05\x06\");
                 }}\n").as_bytes(),
         );
 
@@ -223,9 +227,9 @@ impl Engine for Deno {
             if n > 0 {
                 let buf = String::from_utf8_lossy(&buffer[..n]);
                 let trimmed = buf.trim();
-                std::io::Write::flush(&mut std::io::stdout()).unwrap();
 
-                if trimmed == "\0" {
+                std::io::Write::flush(&mut std::io::stdout()).unwrap();
+                if trimmed == "\x03\x04\x05\x06" {
                     break;
                 }
             }
@@ -236,7 +240,7 @@ impl Engine for Deno {
         let mut stdin_ref = self.stdin.borrow_mut();
         let _ = std::io::Write::write_all(
             &mut *stdin_ref,
-            format!("{index} < globalThis.repl_vars.length\n").as_bytes(),
+            format!("globalThis.repl_vars && {index} < globalThis.repl_vars.length || false\n").as_bytes(),
         );
 
         let mut stdout_ref = self.stdout.borrow_mut();
@@ -247,6 +251,7 @@ impl Engine for Deno {
             let _ = reader.read_line(&mut buffer).expect("Unable to read chunk");
             let trimmed = buffer.trim();
 
+            println!("'{}'", trimmed);
             match trimmed {
                 "true" => return true,
                 "false" => return false,
