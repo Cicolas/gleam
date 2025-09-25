@@ -24,7 +24,8 @@ use std::{
     io::{BufRead, BufReader, Read},
     path::PathBuf,
     process::{ChildStdin, ChildStdout, Command, Stdio},
-    rc::Rc, thread,
+    rc::Rc,
+    thread,
 };
 
 use crate::{
@@ -160,10 +161,11 @@ struct Deno {
 
 impl Engine for Deno {
     fn new(paths: ProjectPaths, package: String) -> Self {
-        let command = Command::new("deno")
-            .arg("repl")
-            .arg("--allow-read")
-            .arg("--quiet")
+        let command = Command::new("node")
+            .arg("-i")
+            // .arg("repl")
+            // .arg("--allow-read")
+            // .arg("--quiet")
             .env("NO_COLOR", "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -204,7 +206,8 @@ impl Engine for Deno {
         let mut stdin_ref = self.stdin.borrow_mut();
         let _ = std::io::Write::write_all(
             &mut *stdin_ref,
-            format!("import {{ {REPL_MAIN} }} from \"{path}\";
+            format!("(async () => {{
+                const {{ {REPL_MAIN} }} = await import(\"{path}\");
                 try {{
                     {REPL_MAIN}();
                 }} catch (err) {{
@@ -217,7 +220,8 @@ impl Engine for Deno {
                     }}
                 }} finally {{
                     console.log(\"\x03\x04\x05\x06\");
-                }}\n").as_bytes(),
+                }}
+            }})()\n").as_bytes(),
         );
 
         let mut stdout_ref = self.stdout.borrow_mut();
@@ -240,7 +244,8 @@ impl Engine for Deno {
         let mut stdin_ref = self.stdin.borrow_mut();
         let _ = std::io::Write::write_all(
             &mut *stdin_ref,
-            format!("globalThis.repl_vars && {index} < globalThis.repl_vars.length || false\n").as_bytes(),
+            format!("globalThis.repl_vars && {index} < globalThis.repl_vars.length || false\n")
+                .as_bytes(),
         );
 
         let mut stdout_ref = self.stdout.borrow_mut();
@@ -251,7 +256,6 @@ impl Engine for Deno {
             let _ = reader.read_line(&mut buffer).expect("Unable to read chunk");
             let trimmed = buffer.trim();
 
-            println!("'{}'", trimmed);
             match trimmed {
                 "true" => return true,
                 "false" => return false,
@@ -367,7 +371,11 @@ impl<E: Engine> Repl<E> {
 
     fn compile(&mut self, code: &str) -> Result<Vec<Module>, Error> {
         // FIXME: avoid name collision
-        let path = TempPath::from_path(self.paths.src_directory().join(format!("repl{}_{}.gleam", self.iter.0, self.iter.1)));
+        let path = TempPath::from_path(
+            self.paths
+                .src_directory()
+                .join(format!("repl{}_{}.gleam", self.iter.0, self.iter.1)),
+        );
 
         let module_name = path.file_stem().unwrap().to_str().unwrap();
 
