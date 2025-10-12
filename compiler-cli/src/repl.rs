@@ -1,4 +1,9 @@
 use camino::Utf8Path;
+use expectrl::{
+    Expect, Session,
+    process::unix::{PtyStream, UnixProcess},
+    stream::log::LogStream,
+};
 use gleam_core::{
     Error,
     analyse::TargetSupport,
@@ -20,12 +25,12 @@ use tempfile::{self, TempPath};
 use std::{
     cell::RefCell,
     collections::HashMap,
-    fmt::Write,
-    io::{BufRead, BufReader, Read},
     path::PathBuf,
-    process::{ChildStdin, ChildStdout, Command, Stdio},
+    process::Command,
     rc::Rc,
-    thread,
+    fmt::Write,
+    sync::mpsc::{self, Sender},
+    time::Duration,
 };
 
 use crate::{
@@ -65,6 +70,7 @@ pub fn repl_load(index: Int) -> a
 @external(javascript, "../gleam_repl.mjs", "repl_print")
 pub fn repl_print(value: a) -> a
 "#;
+const GLEAM_BREAK_CODE: &str = "\u{0204}\u{0169}\u{0156}\u{006E}\u{0068}\u{00FA}\u{0014}\u{01B7}\u{01DD}\u{0077}\u{0014}\u{022D}\u{018D}\u{020D}\u{0118}\u{013A}\u{00B7}\u{015C}\u{01B8}\u{0118}\u{0057}\u{0159}\u{00AB}\u{0047}\u{00BF}\u{0005}\u{002C}\u{00A3}\u{01F5}\u{00FE}\u{00CA}\u{0009}";
 
 pub fn command(paths: &ProjectPaths) -> Result<(), Error> {
     let built = build_with_progress(paths)?;
@@ -151,46 +157,84 @@ trait Engine: Clone {
     fn has_var(&self, index: usize) -> bool;
 }
 
+struct EventWriter {
+    sender: Sender<String>,
+}
+
+impl std::io::Write for EventWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let text = String::from_utf8_lossy(buf);
+
+        // self.sender.send(text.to_string()).ok().unwrap();
+
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+type DenoSession = Session<UnixProcess, LogStream<PtyStream, EventWriter>>;
+
 #[derive(Clone)]
 struct Deno {
-    stdin: Rc<RefCell<ChildStdin>>,
-    stdout: Rc<RefCell<ChildStdout>>,
+    session: Rc<RefCell<DenoSession>>,
     paths: ProjectPaths,
     package: String,
 }
 
 impl Engine for Deno {
     fn new(paths: ProjectPaths, package: String) -> Self {
-        let command = Command::new("node")
-            .arg("-i")
-            // .arg("repl")
-            // .arg("--allow-read")
-            // .arg("--quiet")
+        let mut command = Command::new("deno");
+        let _ = command
+            // .arg("-i")
+            .env("TERM", "dumb")
             .env("NO_COLOR", "1")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("Could not spawn deno subprocess");
+            .arg("repl")
+            .arg("--allow-read")
+            .arg("--quiet");
 
-        let stdin = command.stdin.expect("Could not take Deno stdin");
-        let stdout = command.stdout.expect("Could not take Deno stdout");
-        let mut stderr = command.stderr.expect("Could not take Deno stderr");
+        let (sender, receiver) = mpsc::channel::<String>();
 
-        let _ = thread::spawn(move || {
-            let mut buffer = [0; 1024];
-            loop {
-                let n = stderr.read(&mut buffer).unwrap();
-                if n > 0 {
-                    print!("{}", String::from_utf8_lossy(&buffer[..n]));
-                    std::io::Write::flush(&mut std::io::stdout()).unwrap();
-                }
-            }
-        });
+        // TODO: add a observer thread
+        // let _ = thread::spawn(move || {
+        // let mut last_command: String = "".into();
+        // let mut is_read = false;
+
+        // println!("[Event System] Listening for events...");
+        // for received_event in receiver {
+        // if received_event == "write" || received_event == "read" {
+        //     is_read = false;
+        // }
+
+        // // println!("isread: {}, received_event: {}, last_command: {}", is_read, received_event, last_command);
+        // if is_read && received_event != "\"" {
+        //     print!("{received_event}");
+        // }
+
+        // if received_event == ": " && last_command == "read" {
+        //     is_read = true;
+        // }
+
+        // print!(" '{received_event}' ");
+        // last_command = received_event.clone();
+        // }
+        // println!("\n[Event System] Stopped listening.");
+        // });
+
+        let event_writer = EventWriter { sender };
+
+        let mut session = expectrl::session::log(
+            Session::spawn(command).expect("Could not spawn deno subprocess"),
+            event_writer,
+        )
+        .expect("Unable to log into eventWritter()");
+
+        session.set_expect_timeout(Some(Duration::from_secs(5)));
+        let _ = session.expect("> ").unwrap();
 
         Deno {
-            stdin: Rc::new(RefCell::new(stdin)),
-            stdout: Rc::new(RefCell::new(stdout)),
+            session: Rc::new(RefCell::new(session)),
             paths,
             package,
         }
@@ -203,11 +247,11 @@ impl Engine for Deno {
             .join(&self.package)
             .join(format!("{module}.mjs"));
 
-        let mut stdin_ref = self.stdin.borrow_mut();
-        let _ = std::io::Write::write_all(
-            &mut *stdin_ref,
-            format!("(async () => {{
-                const {{ {REPL_MAIN} }} = await import(\"{path}\");
+        let mut session = self.session.borrow_mut();
+
+        let mut code = format!("
+                import {{ {REPL_MAIN} }} from \"{path}\";
+
                 try {{
                     {REPL_MAIN}();
                 }} catch (err) {{
@@ -219,49 +263,40 @@ impl Engine for Deno {
                         console.error({{err}});
                     }}
                 }} finally {{
-                    console.log(\"\x03\x04\x05\x06\");
-                }}
-            }})()\n").as_bytes(),
-        );
+                    console.log(\"{GLEAM_BREAK_CODE}\");
+                }}");
+        code = code.lines().map(|line| line.trim()).collect();
 
-        let mut stdout_ref = self.stdout.borrow_mut();
-        let mut buffer = [0; 1024];
-        loop {
-            let n = stdout_ref.read(&mut buffer).unwrap();
-            if n > 0 {
-                let buf = String::from_utf8_lossy(&buffer[..n]);
-                let trimmed = buf.trim();
+        let _ = session.send_line(code).unwrap();
 
-                std::io::Write::flush(&mut std::io::stdout()).unwrap();
-                if trimmed == "\x03\x04\x05\x06" {
-                    break;
-                }
-            }
-        }
+        let res = session.expect(GLEAM_BREAK_CODE).unwrap();
+        let _ = session.expect("> ");
+
+        let buf = String::from_utf8_lossy(res.before());
+        let trimmed = buf.trim();
+
+        println!("{trimmed}");
     }
 
     fn has_var(&self, index: usize) -> bool {
-        let mut stdin_ref = self.stdin.borrow_mut();
-        let _ = std::io::Write::write_all(
-            &mut *stdin_ref,
-            format!("globalThis.repl_vars && {index} < globalThis.repl_vars.length || false\n")
-                .as_bytes(),
-        );
+        let mut session = self.session.borrow_mut();
 
-        let mut stdout_ref = self.stdout.borrow_mut();
-        let mut reader = BufReader::new(&mut *stdout_ref);
-        let mut buffer = String::new();
-        loop {
-            buffer.clear();
-            let _ = reader.read_line(&mut buffer).expect("Unable to read chunk");
-            let trimmed = buffer.trim();
+        let code =
+            format!("globalThis.repl_vars && {index} < globalThis.repl_vars.length || false");
 
-            match trimmed {
-                "true" => return true,
-                "false" => return false,
-                _ => {}
-            }
+        session.send_line(code).unwrap();
+
+        let res = session.expect("> ").unwrap();
+
+        let buf = String::from_utf8_lossy(res.before());
+        let trimmed = buf.trim();
+        match trimmed {
+            "true" => return true,
+            "false" => return false,
+            _ => {}
         }
+
+        false
     }
 }
 
