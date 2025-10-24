@@ -1,4 +1,4 @@
-import * as $stdlib$dict from "./gleam_stdlib/dict.mjs";
+import * as $stdlib$dict from "../gleam_stdlib/dict.mjs";
 import {
   Empty as $Empty,
   NonEmpty as $NonEmpty,
@@ -8,7 +8,7 @@ import {
   BitArray as $BitArray,
   List as $List,
   UtfCodepoint as $UtfCodepoint,
-} from "./prelude.mjs";
+} from "../prelude.mjs";
 
 export function repl_save(value) {
     if (!globalThis.repl_vars) {
@@ -28,10 +28,10 @@ export function repl_print(value) {
 
   if (globalThis.process?.stderr?.write) {
     // If we're in Node.js, use `stderr`
-    globalThis.process.stderr.write(string_value);
+    globalThis.process.stdout.write(string_value);
   } else if (globalThis.Deno) {
     // If we're in Deno, use `stderr`
-    globalThis.Deno.stderr.writeSync(new TextEncoder().encode(string_value));
+    globalThis.Deno.stdout.writeSync(new TextEncoder().encode(string_value));
   } else {
     // Otherwise, use `console.log`
     globalThis.console.log(string_value);
