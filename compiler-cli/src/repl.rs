@@ -1,9 +1,4 @@
 use camino::Utf8Path;
-use expectrl::{
-    Expect, Regex, Session,
-    process::unix::{PtyStream, UnixProcess},
-    stream::log::LogStream,
-};
 use gleam_core::{
     Error,
     analyse::TargetSupport,
@@ -11,7 +6,7 @@ use gleam_core::{
         Definition, Function, Pattern, Statement, TargetedDefinition, TypedDefinition,
         TypedFunction, UntypedDefinition, UntypedExpr, UntypedStatement,
     },
-    build::{Built, Codegen, Compile, Mode, Module, Options, Target},
+    build::{Built, Codegen, Compile, Mode, Module, Options, Runtime, Target},
     io::FileSystemWriter,
     parse::{self, ReplItem},
     paths::ProjectPaths,
@@ -21,23 +16,22 @@ use gleam_core::{
 
 use rustyline::{DefaultEditor, error::ReadlineError};
 use tempfile::{self, TempPath};
-use tracing_subscriber::fmt::format;
 
 use std::{
     cell::RefCell,
     collections::HashMap,
-    fmt::Write,
+    fmt::Write as Writefmt,
+    io::{self, Stdout, Write, stdout},
     path::PathBuf,
-    process::Command,
+    process::{Child, ChildStdin, ChildStdout, Command, Stdio},
     rc::Rc,
-    sync::mpsc::{self, Sender},
-    thread,
-    time::Duration,
+    sync::OnceLock,
 };
 
 use crate::{
     cli,
     fs::{ConsoleWarningEmitter, ProjectIO},
+    repl::expect::Session,
 };
 
 #[macro_export]
@@ -80,18 +74,26 @@ pub fn repl_save(value: a) -> a
 @external(erlang, "gleam_repl", "repl_load")
 pub fn repl_load(index: Int) -> a
 
+@external(erlang, "gleam_repl", "repl_has_var")
+pub fn repl_has_var(index: Int) -> a
+
 @external(erlang, "gleam_repl", "repl_print")
 pub fn repl_print(value: a) -> a
 "#;
-// const GLEAM_BREAK_CODE: &str = "\u{0204}\u{0169}\u{0156}\u{006E}\u{0068}\u{00FA}\u{0014}\u{01B7}\u{01DD}\u{0077}\u{0014}\u{022D}\u{018D}\u{020D}\u{0118}\u{013A}\u{00B7}\u{015C}\u{01B8}\u{0118}\u{0057}\u{0159}\u{00AB}\u{0047}\u{00BF}\u{0005}\u{002C}\u{00A3}\u{01F5}\u{00FE}\u{00CA}\u{0009}";
 const GLEAM_BREAK_CODE: &str = "GlEaM";
 
-pub fn command(paths: &ProjectPaths) -> Result<(), Error> {
-    let built = build_with_progress(paths)?;
-    let package = &built.root_package.config.name;
-    let module = built.module_interfaces.get(package);
+pub enum ReplRuntime {
+    Erlang,
+    JavaScript(Runtime),
+}
 
-    let mut repl = Repl::<Erlang>::new(paths.clone(), package.into(), module).unwrap();
+pub fn command(
+    paths: &ProjectPaths,
+    target: Option<Target>,
+    runtime: Option<Runtime>,
+    module: Option<String>,
+) -> Result<(), Error> {
+    let mut repl = setup(paths, target, runtime, module)?;
 
     let mut editor = DefaultEditor::new().unwrap();
     if let Some(history) = &history_path() {
@@ -134,6 +136,60 @@ pub fn command(paths: &ProjectPaths) -> Result<(), Error> {
     Ok(())
 }
 
+fn setup(
+    paths: &ProjectPaths,
+    target: Option<Target>,
+    runtime: Option<Runtime>,
+    module: Option<String>,
+) -> Result<Repl, Error> {
+    // Validate the module path
+    if let Some(mod_path) = &module {
+        if !is_gleam_module(mod_path) {
+            return Err(Error::InvalidModuleName {
+                module: mod_path.to_owned(),
+            });
+        }
+    };
+
+    let built = build_with_progress(paths)?;
+    let mod_config = &built.root_package.config;
+    let package = &built.root_package.config.name;
+    let module = built.module_interfaces.get(package);
+
+    let target = target.unwrap_or(mod_config.target);
+
+    match target {
+        Target::Erlang => match runtime {
+            Some(r) => Err(Error::InvalidRuntime {
+                target: Target::Erlang,
+                invalid_runtime: r,
+            }),
+            _ => Ok(Repl::new(paths.clone(), package.into(), module, ReplRuntime::Erlang).unwrap()),
+        },
+        Target::JavaScript => match runtime.unwrap_or(mod_config.javascript.runtime) {
+            Runtime::NodeJs => todo!(),
+            Runtime::Deno => todo!(),
+            Runtime::Bun => todo!(),
+        },
+    }
+}
+
+/// Check if a module name is a valid gleam module name.
+fn is_gleam_module(module: &str) -> bool {
+    use regex::Regex;
+    static RE: OnceLock<Regex> = OnceLock::new();
+
+    RE.get_or_init(|| {
+        Regex::new(&format!(
+            "^({module}{slash})*{module}$",
+            module = "[a-z][_a-z0-9]*",
+            slash = "/",
+        ))
+        .expect("is_gleam_module() RE regex")
+    })
+    .is_match(module)
+}
+
 fn build_with_progress(paths: &ProjectPaths) -> Result<Built, Error> {
     build(paths, true, true)
 }
@@ -163,123 +219,90 @@ fn build(paths: &ProjectPaths, progress: bool, warnings: bool) -> Result<Built, 
     )
 }
 
-trait Engine: Clone {
-    fn new(paths: ProjectPaths, package: String) -> Self;
-
+trait Engine {
     fn run_main(&mut self, module: &str);
 
-    fn has_var(&self, index: usize) -> bool;
+    fn has_var(&mut self, index: usize) -> bool;
 }
-
-struct EventWriter {
-    sender: Sender<String>,
-}
-
-impl std::io::Write for EventWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let text = String::from_utf8_lossy(buf);
-
-        self.sender.send(text.to_string()).ok().unwrap();
-
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-type ErlangSession = Session<UnixProcess, LogStream<PtyStream, EventWriter>>;
 
 #[derive(Clone)]
 struct Erlang {
-    session: Rc<RefCell<ErlangSession>>,
-    paths: ProjectPaths,
+    session: Rc<RefCell<ReplSession>>,
     package: String,
+    command_num: usize,
+}
+
+impl Erlang {
+    fn new(_paths: ProjectPaths, package: String) -> Self {
+        let mut erl_shell = Command::new("erl");
+
+        let mut session =
+            ReplSession::new(&mut erl_shell).expect("Unable to create erl ReplSession");
+        session.pipe_output(false);
+
+        // Wait for first prompt
+        let _ = session.expect(format!("{}> ", 1).as_str());
+
+        let mut erl = Erlang {
+            session: Rc::new(RefCell::new(session)),
+            package,
+            command_num: 1,
+        };
+
+        let package_name = erl.package.clone();
+
+        // TODO: load project packages
+        // Load gleam stdlib into erl shell
+        erl.import_package("gleam_stdlib");
+
+        // Load the package binaries into erl shell
+        erl.import_package(&package_name);
+
+        erl
+    }
+
+    fn write_import(&mut self, code: &str) -> io::Result<()> {
+        let mut session = self.session.borrow_mut();
+        session.pipe_output(false);
+
+        let _ = session.write(code.trim().as_bytes())?;
+        self.command_num += 1;
+
+        let _ = session.expect(format!("true\n").as_str())?;
+        let _ = session.expect(format!("{}> ", self.command_num).as_str());
+
+        Ok(())
+    }
+
+    fn write_code(&mut self, code: &str) -> io::Result<()> {
+        let mut session = self.session.borrow_mut();
+        session.pipe_output(true);
+
+        let _ = session.write(code.trim().as_bytes())?;
+        self.command_num += 1;
+
+        let _ = session.expect(format!("'{GLEAM_BREAK_CODE}'").as_str())?;
+        let _ = session.expect(format!("{}> ", self.command_num).as_str())?;
+
+        Ok(())
+    }
+
+    fn import_package(&mut self, package_name: &str) {
+        self.write_import(
+            format!(
+                "code:add_patha(\"build/dev/erlang/{}/ebin/\").",
+                package_name
+            )
+            .as_str(),
+        )
+        .expect(format!("Unable to run {} import", package_name).as_str());
+    }
 }
 
 impl Engine for Erlang {
-    fn new(paths: ProjectPaths, package: String) -> Self {
-        let mut command = Command::new("erl");
-        let _ = command
-            // .arg("-i")
-            .env("TERM", "dumb")
-            .env("NO_COLOR", "1");
-
-        let (sender, receiver) = mpsc::channel::<String>();
-
-        // TODO: add a observer thread
-        let _ = thread::spawn(move || {
-            // let mut last_command: String = "".into();
-            // let mut is_read = false;
-
-            // println!("[Event System] Listening for events...");
-            for received_event in receiver {
-                // if received_event == "write" || received_event == "read" {
-                //     is_read = false;
-                // }
-
-                // // println!("isread: {}, received_event: {}, last_command: {}", is_read, received_event, last_command);
-                // if is_read && received_event != "\"" {
-                //     print!("{received_event}");
-                // }
-
-                // if received_event == ": " && last_command == "read" {
-                //     is_read = true;
-                // }
-
-                // print!(" '{received_event}' ");
-                // last_command = received_event.clone();
-            }
-            // println!("\n[Event System] Stopped listening.");
-        });
-
-        let event_writer = EventWriter { sender };
-
-        let mut session = expectrl::session::log(
-            Session::spawn(command).expect("Could not spawn Erlang subprocess"),
-            event_writer,
-        )
-        .expect("Unable to log into eventWritter()");
-
-        let build_dir = paths.build_directory_for_package(Mode::Dev, Target::Erlang, &package);
-
-        session.set_expect_timeout(Some(Duration::from_secs(5)));
-
-        let _ = session.expect(Regex("\\d+> ")).unwrap();
-        session
-            .send_line("code:add_patha(\"build/dev/erlang/gleam_stdlib/ebin/\").")
-            .unwrap();
-        let _ = session.expect(Regex("\\d+> ")).unwrap();
-        session
-            .send_line(format!(
-                "code:add_patha(\"build/dev/erlang/{package}/ebin/\")."
-            ))
-            .unwrap();
-        let _ = session.expect(Regex("\\d+> ")).unwrap();
-        session
-            .send_line(format!(
-                "c(\"{build_dir}/_gleam_artefacts/gleam_repl\", [{{outdir, \"{build_dir}/ebin\"}}])."
-            )).unwrap();
-        let _ = session.expect(Regex("\\d+> ")).unwrap();
-
-        Erlang {
-            session: Rc::new(RefCell::new(session)),
-            paths,
-            package,
-        }
-    }
-
     fn run_main(&mut self, module: &str) {
-        let path = self
-            .paths
-            .build_directory_for_target(Mode::Dev, Target::Erlang)
-            .join(&self.package)
-            .join(format!("{module}.erl"));
-
-        let mut session = self.session.borrow_mut();
-
-        let mut code = format!("
-            try
+        let mut code = format!(
+            "try
                 {module}:repl_main(),
                 '{GLEAM_BREAK_CODE}'
             catch error:#{{
@@ -295,54 +318,37 @@ impl Engine for Erlang {
                     ), '{GLEAM_BREAK_CODE}';
 
                 Class:Reason ->
-                    io:format(standard_error, \"~p~n\", [{{Class, Reason}}]),
+                    io:format(standard_error, \"Internal Erlang Error: ~p~n\", [{{Class, Reason}}]),
                     '{GLEAM_BREAK_CODE}'
-            end.");
-        code = code.lines().map(|line| {
-            let trimmed_line = line.trim();
-            format!("{trimmed_line} ")
-        }).collect();
+            end."
+        );
+        code = code
+            .lines()
+            .map(|line| {
+                let trimmed_line = line.trim();
+                format!("{trimmed_line} ")
+            })
+            .collect::<String>();
 
-        let _ = session
-            .send_line(code)
-            .unwrap();
-
-        let mut buf = "".to_owned();
-        let res = session.expect(format!("\'{GLEAM_BREAK_CODE}\'")).unwrap();
-        buf.push_str(&String::from_utf8_lossy(res.before()));
-        let res = session.expect(Regex("\\d+> ")).unwrap();
-        buf.push_str(&String::from_utf8_lossy(res.before()));
-
-        let trimmed = buf.trim();
-
-        println!("{trimmed}");
+        self.write_code(code.trim())
+            .expect("Unable to run the code");
     }
 
-    fn has_var(&self, index: usize) -> bool {
+    fn has_var(&mut self, index: usize) -> bool {
+        let code = format!("gleam_repl:repl_has_var({index}).");
         let mut session = self.session.borrow_mut();
 
-        let code =
-            format!("gleam_repl:repl_has_var({index}).");
+        let _ = session.write(code.trim().as_bytes()).unwrap();
+        self.command_num += 1;
 
-        session.send_line(code).unwrap();
-
-        let res = session.expect(Regex("\\d+> ")).unwrap();
-
-        let buf = String::from_utf8_lossy(res.before());
-        let trimmed = buf.trim();
-
-        match trimmed {
-            "true" => return true,
-            "false" => return false,
-            _ => {}
-        }
-
-        false
+        let found_var = session.expect("true\n").expect("Unable to expect has_var");
+        let _ = session.expect(format!("{}> ", self.command_num).as_str());
+        found_var
     }
 }
 
 #[derive(Clone)]
-struct Repl<E: Engine> {
+struct Repl {
     user_import: Option<String>,
     imports: Vec<String>,
     consts: Vec<String>,
@@ -351,7 +357,7 @@ struct Repl<E: Engine> {
     vars: HashMap<String, Value>,
     paths: ProjectPaths,
     project: ProjectIO,
-    engine: E,
+    engine: Rc<RefCell<dyn Engine>>,
     iter: (usize, usize),
     var_index: usize,
 }
@@ -362,20 +368,37 @@ struct Value {
     type_: String,
 }
 
-impl<E: Engine> Repl<E> {
+impl Repl {
     pub fn new(
         paths: ProjectPaths,
         package: String,
         module: Option<&ModuleInterface>,
-    ) -> Result<Repl<E>, Error> {
+        runtime: ReplRuntime
+    ) -> Result<Self, Error> {
         let project = ProjectIO::new();
-        let build_dir = paths.build_directory_for_package(Mode::Dev, Target::Erlang, &package);
+        let path = TempPath::from_path(paths.src_directory().join("gleam_repl.erl"));
+
         project
-            .write_bytes(
-                &build_dir.join("_gleam_artefacts").join("gleam_repl.erl"),
-                GLEAM_REPL_ERL,
-            )
+            .write_bytes(Utf8Path::from_path(&path).unwrap(), GLEAM_REPL_ERL)
             .unwrap();
+
+        let _ = build_without_progress(&paths)?;
+
+        let engine = match runtime {
+            ReplRuntime::Erlang => {
+                Erlang::new(paths.clone(), package)
+            },
+            ReplRuntime::JavaScript(Runtime::Deno) => {
+                todo!()
+            },
+            ReplRuntime::JavaScript(Runtime::NodeJs) => {
+                todo!()
+            },
+            ReplRuntime::JavaScript(Runtime::Bun) => {
+                todo!()
+            }
+        };
+
         Ok(Repl {
             user_import: module.map(import_public_types_and_values),
             imports: vec![],
@@ -385,7 +408,7 @@ impl<E: Engine> Repl<E> {
             vars: HashMap::new(),
             paths: paths.clone(),
             project: project.clone(),
-            engine: E::new(paths, package),
+            engine: Rc::new(RefCell::new(engine)),
             iter: (0, 0),
             var_index: 0,
         })
@@ -561,9 +584,9 @@ impl<E: Engine> Repl<E> {
 
         let module = self.compile(&src)?.into_iter().next().unwrap();
 
-        self.engine.run_main(&module.name);
+        self.engine.borrow_mut().run_main(&module.name);
 
-        if self.engine.has_var(self.var_index) {
+        if self.engine.borrow_mut().has_var(self.var_index) {
             let main = get_function(&module, "run_save").expect("repl main function");
             let type_ = type_to_string(&module, &main.return_type);
             let index = self.var_index;
@@ -580,7 +603,7 @@ impl<E: Engine> Repl<E> {
         let mut src = self.build_source();
         self.add_expr(&mut src, code);
         let module = self.compile(&src)?.into_iter().next().unwrap();
-        self.engine.run_main(&module.name);
+        self.engine.borrow_mut().run_main(&module.name);
         Ok(())
     }
 
@@ -669,6 +692,51 @@ impl<E: Engine> Repl<E> {
     }
 }
 
+struct ReplSession {
+    child_stdin: ChildStdin,
+    session: Session<ChildStdout, Stdout>,
+    child: Child,
+}
+
+impl ReplSession {
+    fn new(command: &mut Command) -> io::Result<Self> {
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()?;
+
+        let child_stdin = child.stdin.take().unwrap();
+        let child_stdout = child.stdout.take().unwrap();
+
+        let session = Session::new(child_stdout, stdout());
+
+        Ok(Self {
+            child_stdin,
+            session,
+            child,
+        })
+    }
+
+    fn expect(&mut self, token: &str) -> io::Result<bool> {
+        self.session.expect(token)
+    }
+
+    fn pipe_output(&mut self, enable: bool) {
+        self.session.pipe_output(enable)
+    }
+}
+
+impl Write for ReplSession {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let written = self.child_stdin.write(buf)?;
+        self.child_stdin.write(b"\n").map(|u| u + written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.child_stdin.flush()
+    }
+}
+
 fn get_function<'a>(module: &'a Module, name: &str) -> Option<&'a TypedFunction> {
     module.ast.definitions.iter().find_map(|def| match def {
         TypedDefinition::Function(f) if f.name.as_ref().map(|s| s.1.as_str()) == Some(name) => {
@@ -718,4 +786,129 @@ fn import_public_types_and_values(module: &ModuleInterface) -> String {
 
 fn history_path() -> Option<PathBuf> {
     dirs::home_dir().map(|p| p.join(HISTORY_FILE))
+}
+
+mod expect {
+    use std::{
+        fs::File,
+        io::{self, Error, Read, Write},
+        ops::Deref,
+    };
+
+    pub struct Session<R, W> {
+        input: R,
+        output: W,
+        buffer: Buffer,
+        file: File,
+        pipe_enabled: bool,
+    }
+
+    impl<R: Read, W: Write> Session<R, W> {
+        pub fn new(input: R, output: W) -> Self {
+            Session {
+                input,
+                output,
+                buffer: Buffer::new(),
+                file: File::create("log").unwrap(),
+                pipe_enabled: true,
+            }
+        }
+
+        /// Produces Ok(true) token is found.
+        /// Produces Ok(false) if the input is over and the token is not found.
+        /// Return Error if reading the input fails.
+        pub fn expect(&mut self, token: &str) -> Result<bool, Error> {
+            let token = token.as_bytes();
+            let token_len = token.len();
+            loop {
+                if let Some(pos) = self.buffer.windows(token_len).position(|w| w == token) {
+                    self.write_and_consume(pos, pos + token_len)?;
+                    return Ok(true);
+                }
+
+                // token not found, leave at most token - 1 bytes on the buffer.
+                let to_write = self.buffer.len().saturating_sub(token_len - 1);
+                self.write_and_consume(to_write, to_write)?;
+
+                let n = self.buffer.read(&mut self.input, &mut self.file)?;
+                if n == 0 {
+                    // the input is over, write the remaning bytes.
+                    let len = self.buffer.len();
+                    self.write_and_consume(len, len)?;
+                    return Ok(false);
+                }
+            }
+        }
+
+        fn write_and_consume(&mut self, len: usize, consume: usize) -> Result<(), Error> {
+            if self.pipe_enabled {
+                let _ = self.output.write(&self.buffer[..len])?;
+            }
+            self.output.flush()?;
+            self.buffer.consume(consume);
+            Ok(())
+        }
+
+        pub fn pipe_output(&mut self, enable: bool) {
+            self.pipe_enabled = enable;
+        }
+    }
+
+    struct Buffer {
+        buffer: [u8; 1024],
+        used: usize,
+    }
+
+    impl Buffer {
+        fn new() -> Self {
+            Buffer {
+                buffer: [0; 1024],
+                used: 0,
+            }
+        }
+
+        fn read<R: Read>(&mut self, mut reader: R, file: &mut File) -> io::Result<usize> {
+            let _ = write!(file, "a: ");
+            let _ = file.write(&self.buffer[..self.used]).unwrap();
+            let _ = write!(file, "\n");
+            let n = reader.read(&mut self.buffer[self.used..])?;
+            let _ = write!(file, "b: ");
+            let _ = file.write(&self.buffer[self.used..self.used + n]).unwrap();
+            let _ = write!(file, "\n");
+            file.flush().unwrap();
+            let _ = writeln!(file, "");
+            self.used += n;
+            Ok(n)
+        }
+
+        fn consume(&mut self, n: usize) {
+            self.buffer.copy_within(n.., 0);
+            self.used -= n;
+        }
+    }
+
+    impl Deref for Buffer {
+        type Target = [u8];
+
+        fn deref(&self) -> &Self::Target {
+            &self.buffer[..self.used]
+        }
+    }
+
+    #[test]
+    fn test() {
+        use std::thread;
+        use std::time::Duration;
+        let (input, mut pipe) = io::pipe().unwrap();
+        let _ = thread::spawn(move || {
+            write!(&mut pipe, "Some STOPwordsSTO").unwrap();
+            pipe.flush().unwrap();
+            thread::sleep(Duration::from_millis(100));
+            writeln!(&mut pipe, "Pother STOPend").unwrap();
+        });
+        let mut output = Vec::<u8>::new();
+        let mut session = Session::new(input, &mut output);
+        while session.expect("STOP").unwrap() {}
+        assert_eq!("Some wordsother end\n", String::from_utf8(output).unwrap());
+    }
 }

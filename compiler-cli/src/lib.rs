@@ -212,7 +212,17 @@ enum Command {
     Fix,
 
     /// Start an repl
-    Repl,
+    Repl {
+        #[arg(short, long, ignore_case = true, help = target_doc())]
+        target: Option<Target>,
+
+        #[arg(long, ignore_case = true, help = runtime_doc())]
+        runtime: Option<Runtime>,
+
+        /// The module to run
+        #[arg(short, long)]
+        module: Option<String>,
+    },
 
     /// Start an Erlang shell
     Shell,
@@ -579,9 +589,13 @@ fn parse_and_run_command() -> Result<(), Error> {
             shell::command(&paths)
         }
 
-        Command::Repl => {
+        Command::Repl {
+            target,
+            runtime,
+            module
+         } => {
             let paths = find_project_paths()?;
-            repl::command(&paths)
+            repl::command(&paths, target, runtime, module)
         }
 
         Command::Run {

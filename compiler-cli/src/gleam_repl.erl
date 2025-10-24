@@ -67,14 +67,12 @@ repl_has_var(Index) ->
 repl_print(Value) ->
     StringValue = echo@inspect(Value),
 
-    io:put_chars(
-      standard_error,
+    io:format(
+      "~s",
       [
-        StringValue, $\n
+        StringValue
       ]
     ),
-    % needs to sync with I/O
-    io:get_chars(standard_io, "", 0),
     Value.
 
 echo@inspect(Value) ->
