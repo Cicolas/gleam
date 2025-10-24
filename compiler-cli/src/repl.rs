@@ -18,7 +18,7 @@ use rustyline::{DefaultEditor, error::ReadlineError};
 use tempfile::{self, TempPath};
 
 use std::{
-    cell::RefCell,
+    cell::{Ref, RefCell},
     collections::HashMap,
     fmt::Write as Writefmt,
     io::{self, Stdout, Write, stdout},
@@ -30,6 +30,7 @@ use std::{
 
 use crate::{
     cli,
+    config::PackageKind,
     fs::{ConsoleWarningEmitter, ProjectIO},
     repl::expect::Session,
 };
@@ -58,13 +59,13 @@ const GLEAM_REPL_ERL: &[u8] = include_bytes!("gleam_repl.erl");
 
 const REPL_MAIN: &str = "repl_main";
 const REPL_JS_FNS: &str = r#"
-@external(javascript, "../gleam_repl.mjs", "repl_save")
+@external(javascript, "./gleam_repl.mjs", "repl_save")
 pub fn repl_save(value: a) -> a
 
-@external(javascript, "../gleam_repl.mjs", "repl_load")
+@external(javascript, "./gleam_repl.mjs", "repl_load")
 pub fn repl_load(index: Int) -> a
 
-@external(javascript, "../gleam_repl.mjs", "repl_print")
+@external(javascript, "./gleam_repl.mjs", "repl_print")
 pub fn repl_print(value: a) -> a
 "#;
 const REPL_ERL_FNS: &str = r#"
@@ -81,12 +82,6 @@ pub fn repl_has_var(index: Int) -> a
 pub fn repl_print(value: a) -> a
 "#;
 const GLEAM_BREAK_CODE: &str = "GlEaM";
-
-#[derive(Clone)]
-pub enum ReplRuntime {
-    Erlang,
-    JavaScript(Runtime),
-}
 
 pub fn command(
     paths: &ProjectPaths,
@@ -152,26 +147,25 @@ fn setup(
         }
     };
 
-    let built = build_with_progress(paths)?;
+    let built = build_with_progress(paths, target, module)?;
     let mod_config = &built.root_package.config;
-    let package = &built.root_package.config.name;
+    let package = &mod_config.name;
     let module = built.module_interfaces.get(package);
 
     let target = target.unwrap_or(mod_config.target);
-
     match target {
         Target::Erlang => match runtime {
             Some(r) => Err(Error::InvalidRuntime {
                 target: Target::Erlang,
                 invalid_runtime: r,
             }),
-            _ => Ok(Repl::new(paths.clone(), package.into(), module, ReplRuntime::Erlang).unwrap()),
+            _ => Ok(Repl::new(paths.clone(), package.into(), module, target, runtime).unwrap()),
         },
-        Target::JavaScript => match runtime.unwrap_or(mod_config.javascript.runtime) {
-            Runtime::NodeJs => todo!(),
-            Runtime::Deno => todo!(),
-            Runtime::Bun => todo!(),
-        },
+        Target::JavaScript => {
+            let runtime = runtime.unwrap_or(mod_config.javascript.runtime);
+            println!("({}, {:?})", target, runtime);
+            Ok(Repl::new(paths.clone(), package.into(), module, target, Some(runtime)).unwrap())
+        }
     }
 }
 
@@ -191,15 +185,40 @@ fn is_gleam_module(module: &str) -> bool {
     .is_match(module)
 }
 
-fn build_with_progress(paths: &ProjectPaths) -> Result<Built, Error> {
-    build(paths, true, true)
+fn build_with_progress(
+    paths: &ProjectPaths,
+    target: Option<Target>,
+    module: Option<String>,
+) -> Result<Built, Error> {
+    build(paths, target, module, true, true)
 }
 
-fn build_without_progress(paths: &ProjectPaths) -> Result<Built, Error> {
-    build(paths, false, false)
+fn build_without_progress(
+    paths: &ProjectPaths,
+    target: Option<Target>,
+    module: Option<String>,
+) -> Result<Built, Error> {
+    build(paths, target, module, false, false)
 }
 
-fn build(paths: &ProjectPaths, progress: bool, warnings: bool) -> Result<Built, Error> {
+fn build(
+    paths: &ProjectPaths,
+    target: Option<Target>,
+    module: Option<String>,
+    progress: bool,
+    warnings: bool,
+) -> Result<Built, Error> {
+    let manifest = crate::build::download_dependencies(paths, cli::Reporter::new())?;
+
+    let (mod_config, _) = match &module {
+        Some(mod_path) => {
+            crate::config::find_package_config_for_module(mod_path, &manifest, paths)?
+        }
+        _ => (crate::config::root_config(paths)?, PackageKind::Root),
+    };
+
+    let target = target.unwrap_or(mod_config.target);
+
     crate::build::main_with_warnings(
         paths,
         Options {
@@ -208,10 +227,10 @@ fn build(paths: &ProjectPaths, progress: bool, warnings: bool) -> Result<Built, 
             codegen: Codegen::All,
             compile: Compile::All,
             mode: Mode::Dev,
-            target: Some(Target::Erlang),
+            target: Some(target),
             no_print_progress: !progress,
         },
-        crate::build::download_dependencies(paths, cli::Reporter::new())?,
+        manifest,
         if warnings {
             Rc::new(ConsoleWarningEmitter)
         } else {
@@ -242,7 +261,7 @@ impl Erlang {
         session.pipe_output(false);
 
         // Wait for first prompt
-        let _ = session.expect(format!("{}> ", 1).as_str());
+        let _ = session.expect_erlang_prompt(1);
 
         let mut erl = Erlang {
             session: Rc::new(RefCell::new(session)),
@@ -270,7 +289,7 @@ impl Erlang {
         self.command_num += 1;
 
         let _ = session.expect(format!("true\n").as_str())?;
-        let _ = session.expect_prompt(self.command_num);
+        let _ = session.expect_erlang_prompt(self.command_num);
 
         Ok(())
     }
@@ -283,7 +302,7 @@ impl Erlang {
         self.command_num += 1;
 
         let _ = session.expect(format!("'{GLEAM_BREAK_CODE}'").as_str())?;
-        let _ = session.expect_prompt(self.command_num);
+        let _ = session.expect_erlang_prompt(self.command_num);
 
         Ok(())
     }
@@ -343,7 +362,94 @@ impl Engine for Erlang {
         self.command_num += 1;
 
         let found_var = session.expect("true\n").expect("Unable to expect has_var");
-        let _ = session.expect_prompt(self.command_num);
+        let _ = session.expect_javascript_prompt();
+        found_var
+    }
+}
+
+#[derive(Clone)]
+struct Deno {
+    session: Rc<RefCell<ReplSession>>,
+    paths: ProjectPaths,
+    package: String,
+}
+
+impl Deno {
+    fn new(paths: ProjectPaths, package: String) -> Self {
+        let mut deno_repl = Command::new("deno");
+
+        let mut session = ReplSession::new(deno_repl.env("TERM", "dumb").env("NO_COLOR", "1"))
+            .expect("Unable to create erl ReplSession");
+        session.pipe_output(false);
+
+        // Wait for first prompt
+        let _ = session.expect_javascript_prompt();
+
+        Deno {
+            session: Rc::new(RefCell::new(session)),
+            package,
+            paths,
+        }
+    }
+
+    fn write_import(&mut self, _code: &str) -> io::Result<()> {
+        todo!()
+    }
+
+    fn write_code(&mut self, code: &str) -> io::Result<()> {
+        let mut session = self.session.borrow_mut();
+        session.pipe_output(true);
+
+        let _ = session.write(code.trim().as_bytes())?;
+
+        let _ = session.expect(format!("{GLEAM_BREAK_CODE}\n").as_str())?;
+        let _ = session.expect("Promise { undefined }\n")?;
+        let _ = session.expect_javascript_prompt();
+
+        Ok(())
+    }
+}
+
+impl Engine for Deno {
+    fn run_main(&mut self, module: &str) {
+        let path = self
+            .paths
+            .build_directory_for_target(Mode::Dev, Target::JavaScript)
+            .join(&self.package)
+            .join(format!("{module}.mjs"));
+
+        let mut code = format!("(async () => {{
+                const {{ {REPL_MAIN} }} = await import(\"{path}\");
+
+                try {{
+                    {REPL_MAIN}();
+                }} catch (err) {{
+                    if (err.gleam_error) {{
+                        console.error(
+                            `Error at ${{err.module}}.${{err.function}}:${{err.line}}\n    Gleam error: ${{err.gleam_error}}`
+                        );
+                    }} else {{
+                        console.error({{err}});
+                    }}
+                }} finally {{
+                 console.log(\"{GLEAM_BREAK_CODE}\");
+                }}
+            }})()");
+        code = code.lines().map(|line| line.trim()).collect();
+
+        self.write_code(code.trim())
+            .expect("Unable to run the code");
+    }
+
+    fn has_var(&mut self, index: usize) -> bool {
+        let code =
+            format!("globalThis.repl_vars && {index} < globalThis.repl_vars.length || false");
+
+        let mut session = self.session.borrow_mut();
+        let _ = session.write(code.trim().as_bytes()).unwrap();
+
+        let found_var = session.expect("true\n").expect("Unable to expect has_var");
+        let _ = session.expect_javascript_prompt();
         found_var
     }
 }
@@ -359,7 +465,7 @@ struct Repl {
     paths: ProjectPaths,
     project: ProjectIO,
     engine: Rc<RefCell<dyn Engine>>,
-    runtime: ReplRuntime,
+    target: Target,
     iter: (usize, usize),
     var_index: usize,
 }
@@ -375,31 +481,44 @@ impl Repl {
         paths: ProjectPaths,
         package: String,
         module: Option<&ModuleInterface>,
-        runtime: ReplRuntime
+        target: Target,
+        runtime: Option<Runtime>,
     ) -> Result<Self, Error> {
+        let (repl_file, repl_content) = match target {
+            Target::Erlang => ("gleam_repl.erl", GLEAM_REPL_ERL),
+            Target::JavaScript => ("gleam_repl.mjs", GLEAM_REPL_MJS),
+        };
+
         let project = ProjectIO::new();
-        let path = TempPath::from_path(paths.src_directory().join("gleam_repl.erl"));
+        let path = TempPath::from_path(paths.src_directory().join(repl_file));
 
         project
-            .write_bytes(Utf8Path::from_path(&path).unwrap(), GLEAM_REPL_ERL)
+            .write_bytes(Utf8Path::from_path(&path).unwrap(), repl_content)
             .unwrap();
 
-        let _ = build_without_progress(&paths)?;
+        let _ = build_without_progress(&paths, Some(target), module.map(|m| m.name.to_string()))?;
 
-        let engine = match runtime {
-            ReplRuntime::Erlang => {
-                Erlang::new(paths.clone(), package)
-            },
-            ReplRuntime::JavaScript(Runtime::Deno) => {
-                todo!()
-            },
-            ReplRuntime::JavaScript(Runtime::NodeJs) => {
-                todo!()
-            },
-            ReplRuntime::JavaScript(Runtime::Bun) => {
-                todo!()
+        type EngineMatch = Rc<RefCell<dyn Engine>>;
+        let engine: Rc<RefCell<dyn Engine>> = match (target, runtime) {
+            (Target::Erlang, None) => {
+                let r: EngineMatch = Rc::new(RefCell::new(Erlang::new(paths.clone(), package)));
+                Ok(r)
             }
-        };
+            (Target::Erlang, Some(r)) => Err(Error::InvalidRuntime {
+                target: Target::Erlang,
+                invalid_runtime: r,
+            }),
+
+            (Target::JavaScript, Some(Runtime::Deno)) => {
+                let r: EngineMatch = Rc::new(RefCell::new(Deno::new(paths.clone(), package)));
+                Ok(r)
+            }
+            (Target::JavaScript, Some(Runtime::NodeJs)) => todo!(),
+            (Target::JavaScript, Some(Runtime::Bun)) => todo!(),
+            // This one is unreachable becuase on setup() it unwraps or
+            // with the project default runtime
+            (Target::JavaScript, None) => unreachable!(),
+        }?;
 
         Ok(Repl {
             user_import: module.map(import_public_types_and_values),
@@ -410,8 +529,8 @@ impl Repl {
             vars: HashMap::new(),
             paths: paths.clone(),
             project: project.clone(),
-            engine: Rc::new(RefCell::new(engine)),
-            runtime: runtime,
+            engine: engine,
+            target: target,
             iter: (0, 0),
             var_index: 0,
         })
@@ -466,7 +585,11 @@ impl Repl {
 
     fn build_source(&self) -> String {
         let mut src = String::new();
-        src.push_str(REPL_ERL_FNS);
+        let gleam_repl_fns = match self.target {
+            Target::Erlang => REPL_ERL_FNS,
+            Target::JavaScript => REPL_JS_FNS,
+        };
+        src.push_str(gleam_repl_fns);
         self.add_imports(&mut src);
         self.add_consts(&mut src);
         self.add_types(&mut src);
@@ -489,7 +612,13 @@ impl Repl {
             .write(Utf8Path::from_path(&path).unwrap(), code)
             .unwrap();
 
-        let mut modules = build_without_progress(&self.paths)?.root_package.modules;
+        let mut modules = build_without_progress(
+            &self.paths,
+            Some(self.target),
+            Some(module_name.to_string()),
+        )?
+        .root_package
+        .modules;
 
         let pos = modules
             .iter()
@@ -724,8 +853,12 @@ impl ReplSession {
         self.session.expect(token)
     }
 
-    fn expect_prompt(&mut self, command_num: usize) -> io::Result<bool> {
+    fn expect_erlang_prompt(&mut self, command_num: usize) -> io::Result<bool> {
         self.session.expect(format!("{}> ", command_num).as_str())
+    }
+
+    fn expect_javascript_prompt(&mut self) -> io::Result<bool> {
+        self.session.expect("> ")
     }
 
     fn pipe_output(&mut self, enable: bool) {

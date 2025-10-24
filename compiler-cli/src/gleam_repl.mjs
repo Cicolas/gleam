@@ -1,4 +1,4 @@
-import * as $stdlib$dict from "./gleam_stdlib/dict.mjs";
+import * as $stdlib$dict from "../gleam_stdlib/dict.mjs";
 import {
   Empty as $Empty,
   NonEmpty as $NonEmpty,
@@ -8,7 +8,7 @@ import {
   BitArray as $BitArray,
   List as $List,
   UtfCodepoint as $UtfCodepoint,
-} from "./prelude.mjs";
+} from "../prelude.mjs";
 
 export function repl_save(value) {
     if (!globalThis.repl_vars) {
