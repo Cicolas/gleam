@@ -18,12 +18,12 @@ use rustyline::{DefaultEditor, error::ReadlineError};
 use tempfile::{self, TempPath};
 
 use std::{
-    cell::{Ref, RefCell},
+    cell::RefCell,
     collections::HashMap,
     fmt::Write as Writefmt,
     io::{self, stdout, PipeReader, Stdout, Write},
     path::PathBuf,
-    process::{Child, ChildStdin, ChildStdout, Command, Stdio},
+    process::{Child, ChildStdin, Command, Stdio},
     rc::Rc,
     sync::OnceLock,
 };
@@ -89,6 +89,9 @@ pub fn command(
     runtime: Option<Runtime>,
     module: Option<String>,
 ) -> Result<(), Error> {
+    // Don't exit on ctrl+c as it is used by child erlang shell
+    ctrlc::set_handler(move || {}).expect("Error setting Ctrl-C handler");
+
     let mut repl = setup(paths, target, runtime, module)?;
 
     let mut editor = DefaultEditor::new().unwrap();
@@ -163,7 +166,6 @@ fn setup(
         },
         Target::JavaScript => {
             let runtime = runtime.unwrap_or(mod_config.javascript.runtime);
-            println!("({}, {:?})", target, runtime);
             Ok(Repl::new(paths.clone(), package.into(), module, target, Some(runtime)).unwrap())
         }
     }
@@ -392,10 +394,11 @@ impl Deno {
         }
     }
 
-    fn write_import(&mut self, _code: &str) -> io::Result<()> {
+    fn _write_import(&mut self, _code: &str) -> io::Result<()> {
         todo!()
     }
 
+    // TODO: merge write_code implementation of Node and Deno
     fn write_code(&mut self, code: &str) -> io::Result<()> {
         let mut session = self.session.borrow_mut();
         session.pipe_output(true);
@@ -470,7 +473,7 @@ impl Nodejs {
         }
     }
 
-    fn write_import(&mut self, _code: &str) -> io::Result<()> {
+    fn _write_import(&mut self, _code: &str) -> io::Result<()> {
         todo!()
     }
 
@@ -570,7 +573,13 @@ impl Repl {
                 let r: EngineMatch = Rc::new(RefCell::new(Nodejs::new(paths.clone(), package)));
                 Ok(r)
             }
-            (Target::JavaScript, Some(Runtime::Bun)) => todo!(),
+            // This is not implemented yet due to bun REPL limitations
+            // waiting for some update of Bun team, there is already an issue
+            // on their github about (1), follow the issues:
+            // (1) bun repl: https://github.com/oven-sh/bun/issues/947
+            // (2) bun repl fix PR: https://github.com/jhmaster2000/bun-repl/pull/18
+            // this bug (2) is what is limiting us to implement Bun engine
+            (Target::JavaScript, Some(Runtime::Bun)) => unimplemented!(),
             // This one is unreachable becuase on setup() it unwraps or
             // with the project default runtime
             (Target::JavaScript, None) => unreachable!(),
@@ -883,7 +892,8 @@ impl Repl {
 struct ReplSession {
     child_stdin: ChildStdin,
     session: Session<PipeReader, Stdout>,
-    child: Child,
+    // TODO: add child interruption
+    _child: Child,
 }
 
 impl ReplSession {
@@ -904,7 +914,7 @@ impl ReplSession {
         Ok(Self {
             child_stdin,
             session,
-            child,
+            _child: child,
         })
     }
 
