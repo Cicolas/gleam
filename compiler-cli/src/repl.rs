@@ -21,7 +21,7 @@ use std::{
     cell::{Ref, RefCell},
     collections::HashMap,
     fmt::Write as Writefmt,
-    io::{self, Stdout, Write, stdout},
+    io::{self, stdout, PipeReader, Stdout, Write},
     path::PathBuf,
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
     rc::Rc,
@@ -379,7 +379,7 @@ impl Deno {
         let mut deno_repl = Command::new("deno");
 
         let mut session = ReplSession::new(deno_repl.env("TERM", "dumb").env("NO_COLOR", "1"))
-            .expect("Unable to create erl ReplSession");
+            .expect("Unable to create deno ReplSession");
         session.pipe_output(false);
 
         // Wait for first prompt
@@ -403,7 +403,7 @@ impl Deno {
         let _ = session.write(code.trim().as_bytes())?;
 
         let _ = session.expect(format!("{GLEAM_BREAK_CODE}\n").as_str())?;
-        let _ = session.expect("Promise { undefined }\n")?;
+        let _ = session.expect("undefined\n")?;
         let _ = session.expect_javascript_prompt();
 
         Ok(())
@@ -412,39 +412,92 @@ impl Deno {
 
 impl Engine for Deno {
     fn run_main(&mut self, module: &str) {
-        let path = self
-            .paths
-            .build_directory_for_target(Mode::Dev, Target::JavaScript)
-            .join(&self.package)
-            .join(format!("{module}.mjs"));
-
-        let mut code = format!("(async () => {{
-                const {{ {REPL_MAIN} }} = await import(\"{path}\");
-
-                try {{
-                    {REPL_MAIN}();
-                }} catch (err) {{
-                    if (err.gleam_error) {{
-                        console.error(
-                            `Error at ${{err.module}}.${{err.function}}:${{err.line}}\n    Gleam error: ${{err.gleam_error}}`
-                        );
-                    }} else {{
-                        console.error({{err}});
-                    }}
-                }} finally {{
-                 console.log(\"{GLEAM_BREAK_CODE}\");
-                }}
-            }})()");
-        code = code.lines().map(|line| line.trim()).collect();
+        let code = write_js_code(&self.paths, &self.package, module);
 
         self.write_code(code.trim())
             .expect("Unable to run the code");
     }
 
     fn has_var(&mut self, index: usize) -> bool {
-        let code =
-            format!("globalThis.repl_vars && {index} < globalThis.repl_vars.length || false");
+        let code = js_has_var(index);
+        let mut session = self.session.borrow_mut();
+        let _ = session.write(code.trim().as_bytes()).unwrap();
 
+        let found_var = session.expect("true\n").expect("Unable to expect has_var");
+        let _ = session.expect_javascript_prompt();
+        found_var
+    }
+}
+
+#[derive(Clone)]
+struct Nodejs {
+    session: Rc<RefCell<ReplSession>>,
+    paths: ProjectPaths,
+    package: String,
+}
+
+impl Nodejs {
+    fn new(paths: ProjectPaths, package: String) -> Self {
+        let mut node_repl = Command::new("node");
+
+        let mut session = ReplSession::new(
+            node_repl
+                .env("TERM", "dumb")
+                .env("NO_COLOR", "1")
+                .arg("-e")
+                .arg(
+                    "require(\"repl\");
+
+                    const server = repl.start({
+                        useColors: false,
+                        prompt: \"> \",
+                        terminal: false,
+                        useGlobal: true,
+                    });
+                ",
+                ),
+        )
+        .expect("Unable to create node ReplSession");
+        session.pipe_output(false);
+
+        // Wait for first prompt
+        let _ = session.expect_javascript_prompt();
+
+        Nodejs {
+            session: Rc::new(RefCell::new(session)),
+            package,
+            paths,
+        }
+    }
+
+    fn write_import(&mut self, _code: &str) -> io::Result<()> {
+        todo!()
+    }
+
+    fn write_code(&mut self, code: &str) -> io::Result<()> {
+        let mut session = self.session.borrow_mut();
+        session.pipe_output(true);
+
+        let _ = session.write(code.trim().as_bytes())?;
+
+        let _ = session.expect(format!("{GLEAM_BREAK_CODE}\n").as_str())?;
+        let _ = session.expect("undefined\n")?;
+        let _ = session.expect_javascript_prompt();
+
+        Ok(())
+    }
+}
+
+impl Engine for Nodejs {
+    fn run_main(&mut self, module: &str) {
+        let code = write_js_code(&self.paths, &self.package, module);
+
+        self.write_code(code.trim())
+            .expect("Unable to run the code");
+    }
+
+    fn has_var(&mut self, index: usize) -> bool {
+        let code = js_has_var(index);
         let mut session = self.session.borrow_mut();
         let _ = session.write(code.trim().as_bytes()).unwrap();
 
@@ -513,7 +566,10 @@ impl Repl {
                 let r: EngineMatch = Rc::new(RefCell::new(Deno::new(paths.clone(), package)));
                 Ok(r)
             }
-            (Target::JavaScript, Some(Runtime::NodeJs)) => todo!(),
+            (Target::JavaScript, Some(Runtime::NodeJs)) => {
+                let r: EngineMatch = Rc::new(RefCell::new(Nodejs::new(paths.clone(), package)));
+                Ok(r)
+            }
             (Target::JavaScript, Some(Runtime::Bun)) => todo!(),
             // This one is unreachable becuase on setup() it unwraps or
             // with the project default runtime
@@ -826,21 +882,24 @@ impl Repl {
 
 struct ReplSession {
     child_stdin: ChildStdin,
-    session: Session<ChildStdout, Stdout>,
+    session: Session<PipeReader, Stdout>,
     child: Child,
 }
 
 impl ReplSession {
     fn new(command: &mut Command) -> io::Result<Self> {
+        // Chain STDOUT and STDERR
+        let (reader, writer) = io::pipe()?;
+
         let mut child = command
             .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
+            .stdout(writer.try_clone()?)
+            .stderr(writer)
             .spawn()?;
 
         let child_stdin = child.stdin.take().unwrap();
-        let child_stdout = child.stdout.take().unwrap();
 
-        let session = Session::new(child_stdout, stdout());
+        let session = Session::new(reader, stdout());
 
         Ok(Self {
             child_stdin,
@@ -926,6 +985,35 @@ fn import_public_types_and_values(module: &ModuleInterface) -> String {
 
 fn history_path() -> Option<PathBuf> {
     dirs::home_dir().map(|p| p.join(HISTORY_FILE))
+}
+
+fn write_js_code(paths: &ProjectPaths, package: &str, module: &str) -> String {
+    let path = paths
+        .build_directory_for_target(Mode::Dev, Target::JavaScript)
+        .join(package)
+        .join(format!("{module}.mjs"));
+
+    format!("await (async () => {{
+                const {{ {REPL_MAIN} }} = await import(\"{path}\");
+
+                try {{
+                    {REPL_MAIN}();
+                }} catch (err) {{
+                    if (err.gleam_error) {{
+                        console.error(
+                            `Error at ${{err.module}}.${{err.function}}:${{err.line}}\n    Gleam error: ${{err.gleam_error}}`
+                        );
+                    }} else {{
+                        console.error({{err}});
+                    }}
+                }} finally {{
+                 console.log(\"{GLEAM_BREAK_CODE}\");
+                }}
+            }})()").lines().map(|line| line.trim()).collect()
+}
+
+fn js_has_var(index: usize) -> String {
+    format!("globalThis.repl_vars && {index} < globalThis.repl_vars.length || false")
 }
 
 mod expect {
