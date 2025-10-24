@@ -82,6 +82,7 @@ pub fn repl_print(value: a) -> a
 "#;
 const GLEAM_BREAK_CODE: &str = "GlEaM";
 
+#[derive(Clone)]
 pub enum ReplRuntime {
     Erlang,
     JavaScript(Runtime),
@@ -269,7 +270,7 @@ impl Erlang {
         self.command_num += 1;
 
         let _ = session.expect(format!("true\n").as_str())?;
-        let _ = session.expect(format!("{}> ", self.command_num).as_str());
+        let _ = session.expect_prompt(self.command_num);
 
         Ok(())
     }
@@ -282,7 +283,7 @@ impl Erlang {
         self.command_num += 1;
 
         let _ = session.expect(format!("'{GLEAM_BREAK_CODE}'").as_str())?;
-        let _ = session.expect(format!("{}> ", self.command_num).as_str())?;
+        let _ = session.expect_prompt(self.command_num);
 
         Ok(())
     }
@@ -342,7 +343,7 @@ impl Engine for Erlang {
         self.command_num += 1;
 
         let found_var = session.expect("true\n").expect("Unable to expect has_var");
-        let _ = session.expect(format!("{}> ", self.command_num).as_str());
+        let _ = session.expect_prompt(self.command_num);
         found_var
     }
 }
@@ -358,6 +359,7 @@ struct Repl {
     paths: ProjectPaths,
     project: ProjectIO,
     engine: Rc<RefCell<dyn Engine>>,
+    runtime: ReplRuntime,
     iter: (usize, usize),
     var_index: usize,
 }
@@ -409,6 +411,7 @@ impl Repl {
             paths: paths.clone(),
             project: project.clone(),
             engine: Rc::new(RefCell::new(engine)),
+            runtime: runtime,
             iter: (0, 0),
             var_index: 0,
         })
@@ -719,6 +722,10 @@ impl ReplSession {
 
     fn expect(&mut self, token: &str) -> io::Result<bool> {
         self.session.expect(token)
+    }
+
+    fn expect_prompt(&mut self, command_num: usize) -> io::Result<bool> {
+        self.session.expect(format!("{}> ", command_num).as_str())
     }
 
     fn pipe_output(&mut self, enable: bool) {
