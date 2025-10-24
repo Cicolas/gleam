@@ -14,14 +14,17 @@ use gleam_core::{
     warning::NullWarningEmitterIO,
 };
 
+use itertools::Itertools;
 use rustyline::{DefaultEditor, error::ReadlineError};
 use tempfile::{self, TempPath};
+use toml_edit::value;
 
+use core::panic;
 use std::{
     cell::RefCell,
     collections::HashMap,
     fmt::Write as Writefmt,
-    io::{self, stdout, PipeReader, Stdout, Write},
+    io::{self, PipeReader, Stdout, Write, stdout},
     path::PathBuf,
     process::{Child, ChildStdin, Command, Stdio},
     rc::Rc,
@@ -513,7 +516,7 @@ impl Engine for Nodejs {
 #[derive(Clone)]
 struct Repl {
     user_import: Option<String>,
-    imports: Vec<String>,
+    imports: HashMap<String, (Vec<String>, Vec<String>)>,
     consts: Vec<String>,
     types: Vec<String>,
     fns: HashMap<String, String>,
@@ -587,7 +590,7 @@ impl Repl {
 
         Ok(Repl {
             user_import: module.map(import_public_types_and_values),
-            imports: vec![],
+            imports: HashMap::new(),
             consts: vec![],
             types: vec![],
             fns: HashMap::new(),
@@ -701,7 +704,23 @@ impl Repl {
         let mut src = get_definition_src(&targeted.definition, src).into();
 
         match &targeted.definition {
-            Definition::Import(_) => self.run_import(src),
+            Definition::Import(im) => {
+                let module = &im.module;
+
+                // TODO: Check user imports
+
+                let mut unqualified_values = Vec::<String>::new();
+                for value in &im.unqualified_values {
+                    unqualified_values.push(value.name.clone().to_string());
+                }
+
+                let mut unqualified_types = Vec::<String>::new();
+                for value in &im.unqualified_types {
+                    unqualified_types.push(value.name.clone().to_string());
+                }
+
+                self.run_import(module.into(), unqualified_values, unqualified_types)
+            }
             Definition::TypeAlias(_) | Definition::CustomType(_) => self.run_type(src),
             Definition::ModuleConstant(_) => self.run_const(src),
             Definition::Function(f) => {
@@ -804,13 +823,28 @@ impl Repl {
         Ok(())
     }
 
-    fn run_import(&mut self, _code: String) -> Result<(), Error> {
-        println!("imports are not supported.");
+    fn run_import(
+        &mut self,
+        module: String,
+        mut values: Vec<String>,
+        mut types: Vec<String>,
+    ) -> Result<(), Error> {
+        let _ = match self.imports.get_mut(&module) {
+            Some((inner_values, inner_types)) => {
+                if values.is_empty() && types.is_empty() {
+                    inner_values.clear();
+                    inner_types.clear();
+                } else {
+                    inner_values.append(&mut values);
+                    inner_types.append(&mut types);
+                }
+            }
+            None => {
+                let _ = self.imports.insert(module, (values, types));
+            }
+        };
+
         Ok(())
-        // TODO: implement import merge
-        // import gleam/string.{append}
-        // import gleam/string.{inspect}
-        // -> import gleam/string.{append, inspect}
     }
 
     fn run_const(&mut self, code: String) -> Result<(), Error> {
@@ -852,8 +886,16 @@ impl Repl {
         if let Some(user) = &self.user_import {
             swriteln!(src, "{user}");
         }
-        for import in &self.imports {
-            swriteln!(src, "import {import}");
+        for (module, (values, types)) in &self.imports {
+            let unqualified_values = values.join(", ");
+            let unqualified_types = types.iter().map(|name| format!("type {}", name)).join(", ");
+
+            let unqualified_import = [unqualified_values, unqualified_types]
+                .iter()
+                .filter(|imports| !imports.is_empty())
+                .join(", ");
+
+            swriteln!(src, "import {module}.{{{unqualified_import}}}");
         }
     }
 
