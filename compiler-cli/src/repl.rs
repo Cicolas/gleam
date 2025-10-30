@@ -17,12 +17,10 @@ use gleam_core::{
 use itertools::Itertools;
 use rustyline::{DefaultEditor, error::ReadlineError};
 use tempfile::{self, TempPath};
-use toml_edit::value;
 
-use core::panic;
 use std::{
     cell::RefCell,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fmt::Write as Writefmt,
     io::{self, PipeReader, Stdout, Write, stdout},
     path::PathBuf,
@@ -57,8 +55,8 @@ const QUIT: &str = ":quit";
 const TYPE: &str = ":type ";
 
 // FIXME: use echo template file
-const GLEAM_REPL_MJS: &[u8] = include_bytes!("gleam_repl.mjs");
-const GLEAM_REPL_ERL: &[u8] = include_bytes!("gleam_repl.erl");
+const GLEAM_REPL_MJS: &[u8] = include_bytes!("../templates/gleam_repl.mjs");
+const GLEAM_REPL_ERL: &[u8] = include_bytes!("../templates/gleam_repl.erl");
 
 const REPL_MAIN: &str = "repl_main";
 const REPL_JS_FNS: &str = r#"
@@ -397,10 +395,6 @@ impl Deno {
         }
     }
 
-    fn _write_import(&mut self, _code: &str) -> io::Result<()> {
-        todo!()
-    }
-
     // TODO: merge write_code implementation of Node and Deno
     fn write_code(&mut self, code: &str) -> io::Result<()> {
         let mut session = self.session.borrow_mut();
@@ -476,10 +470,6 @@ impl Nodejs {
         }
     }
 
-    fn _write_import(&mut self, _code: &str) -> io::Result<()> {
-        todo!()
-    }
-
     fn write_code(&mut self, code: &str) -> io::Result<()> {
         let mut session = self.session.borrow_mut();
         session.pipe_output(true);
@@ -515,8 +505,8 @@ impl Engine for Nodejs {
 
 #[derive(Clone)]
 struct Repl {
-    user_import: Option<String>,
-    imports: HashMap<String, (Vec<String>, Vec<String>)>,
+    user_import: Option<(String, QualifiedImport)>,
+    imports: HashMap<String, QualifiedImport>,
     consts: Vec<String>,
     types: Vec<String>,
     fns: HashMap<String, String>,
@@ -533,6 +523,12 @@ struct Repl {
 struct Value {
     index: usize,
     type_: String,
+}
+
+#[derive(Clone)]
+struct QualifiedImport {
+    values: HashSet<String>,
+    types: HashSet<String>,
 }
 
 impl Repl {
@@ -705,21 +701,30 @@ impl Repl {
 
         match &targeted.definition {
             Definition::Import(im) => {
-                let module = &im.module;
+                if im.as_name.is_some() {
+                    println!("aliassing are not supported in import definitions.");
+                    return Ok(());
+                }
 
-                // TODO: Check user imports
+                let module_name = &im.module;
 
-                let mut unqualified_values = Vec::<String>::new();
+                let mut unqualified_values = HashSet::<String>::new();
                 for value in &im.unqualified_values {
-                    unqualified_values.push(value.name.clone().to_string());
+                    let _ = unqualified_values.insert(value.name.clone().to_string());
                 }
 
-                let mut unqualified_types = Vec::<String>::new();
+                let mut unqualified_types = HashSet::<String>::new();
                 for value in &im.unqualified_types {
-                    unqualified_types.push(value.name.clone().to_string());
+                    let _ = unqualified_types.insert(value.name.clone().to_string());
                 }
 
-                self.run_import(module.into(), unqualified_values, unqualified_types)
+                self.run_import(
+                    module_name.into(),
+                    QualifiedImport {
+                        values: unqualified_values,
+                        types: unqualified_types,
+                    },
+                )
             }
             Definition::TypeAlias(_) | Definition::CustomType(_) => self.run_type(src),
             Definition::ModuleConstant(_) => self.run_const(src),
@@ -826,25 +831,24 @@ impl Repl {
     fn run_import(
         &mut self,
         module: String,
-        mut values: Vec<String>,
-        mut types: Vec<String>,
+        qualified_import: QualifiedImport,
     ) -> Result<(), Error> {
         let _ = match self.imports.get_mut(&module) {
-            Some((inner_values, inner_types)) => {
-                if values.is_empty() && types.is_empty() {
-                    inner_values.clear();
-                    inner_types.clear();
+            Some(import) => {
+                if qualified_import.values.is_empty() && qualified_import.types.is_empty() {
+                    import.values.clear();
+                    import.types.clear();
                 } else {
-                    inner_values.append(&mut values);
-                    inner_types.append(&mut types);
+                    import.values.extend(qualified_import.values);
+                    import.types.extend(qualified_import.types);
                 }
             }
             None => {
-                let _ = self.imports.insert(module, (values, types));
+                let _ = self.imports.insert(module, qualified_import);
             }
         };
 
-        Ok(())
+        self.run_check()
     }
 
     fn run_const(&mut self, code: String) -> Result<(), Error> {
@@ -884,18 +888,10 @@ impl Repl {
 
     fn add_imports(&self, src: &mut String) {
         if let Some(user) = &self.user_import {
-            swriteln!(src, "{user}");
+            swriteln!(src, "{}", write_import(&user.0, &user.1));
         }
-        for (module, (values, types)) in &self.imports {
-            let unqualified_values = values.join(", ");
-            let unqualified_types = types.iter().map(|name| format!("type {}", name)).join(", ");
-
-            let unqualified_import = [unqualified_values, unqualified_types]
-                .iter()
-                .filter(|imports| !imports.is_empty())
-                .join(", ");
-
-            swriteln!(src, "import {module}.{{{unqualified_import}}}");
+        for (module, import) in &self.imports {
+            swriteln!(src, "{}", write_import(module, import));
         }
     }
 
@@ -1021,18 +1017,25 @@ fn type_to_string(module: &Module, type_: &Type) -> String {
     Printer::new(&module.ast.names).print_type(type_).into()
 }
 
-fn import_public_types_and_values(module: &ModuleInterface) -> String {
-    let mut import = String::new();
+fn import_public_types_and_values(module: &ModuleInterface) -> (String, QualifiedImport) {
     let name = &module.name;
-    swrite!(&mut import, "import {name}.{{");
+
+    let mut public_types = HashSet::<String>::new();
     for type_ in module.public_type_names() {
-        swrite!(&mut import, "type {type_}, ");
+        let _ = public_types.insert(type_.clone().to_string());
     }
+    let mut public_values = HashSet::<String>::new();
     for value in module.public_value_names() {
-        swrite!(&mut import, "{value}, ");
+        let _ = public_values.insert(value.clone().to_string());
     }
-    import.push('}');
-    import
+
+    (
+        name.to_string(),
+        QualifiedImport{
+            values: public_values,
+            types: public_types
+        }
+    )
 }
 
 fn history_path() -> Option<PathBuf> {
@@ -1066,6 +1069,22 @@ fn write_js_code(paths: &ProjectPaths, package: &str, module: &str) -> String {
 
 fn js_has_var(index: usize) -> String {
     format!("globalThis.repl_vars && {index} < globalThis.repl_vars.length || false")
+}
+
+fn write_import(name: &str, qualified_import: &QualifiedImport) -> String {
+    let unqualified_values = qualified_import.values.iter().join(", ");
+    let unqualified_types = qualified_import
+        .types
+        .iter()
+        .map(|name| format!("type {}", name))
+        .join(", ");
+
+    let unqualified_import = [unqualified_values, unqualified_types]
+        .iter()
+        .filter(|imports| !imports.is_empty())
+        .join(", ");
+
+    format!("import {name}.{{{unqualified_import}}}")
 }
 
 mod expect {
